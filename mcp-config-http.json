@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "document-image-extractor": {
+      "url": "http://localhost:8000/sse",
+      "transport": "sse",
+      "description": "Extract images from PDF and Word documents via HTTP MCP server"
+    }
+  }
+}

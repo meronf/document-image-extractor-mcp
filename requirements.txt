@@ -1,0 +1,10 @@
+# Core MCP dependencies
+mcp>=1.11.0
+
+# Document processing
+pillow>=11.3.0
+pymupdf>=1.26.3
+
+# HTTP server
+starlette>=0.27.0
+uvicorn>=0.23.0

@@ -7,6 +7,9 @@ import asyncio
 import os
 import json
 import logging
+import base64
+import tempfile
+import shutil
 from typing import List, Dict, Optional, Tuple, Union
 from pathlib import Path
 
@@ -14,7 +17,10 @@ from mcp.server.models import InitializationOptions
 import mcp.types as types
 from mcp.server import NotificationOptions, Server
 from pydantic import AnyUrl
-import mcp.server.stdio
+from mcp.server.sse import SseServerTransport
+from starlette.applications import Starlette
+from starlette.routing import Route
+from starlette.responses import Response, JSONResponse
 
 # Document processing imports
 import fitz  # PyMuPDF
@@ -54,6 +60,42 @@ class FileUtils:
     def create_output_directory(output_dir: str) -> None:
         """Create output directory if it doesn't exist."""
         os.makedirs(output_dir, exist_ok=True)
+
+
+class Base64Utils:
+    """Utility functions for base64 encoding/decoding."""
+    
+    @staticmethod
+    def decode_base64_to_file(base64_data: str, output_path: str) -> None:
+        """Decode base64 string and save to file."""
+        # Remove data URL prefix if present (e.g., 'data:application/pdf;base64,')
+        if ',' in base64_data and base64_data.startswith('data:'):
+            base64_data = base64_data.split(',', 1)[1]
+        
+        decoded_data = base64.b64decode(base64_data)
+        with open(output_path, 'wb') as f:
+            f.write(decoded_data)
+    
+    @staticmethod
+    def encode_file_to_base64(file_path: str) -> str:
+        """Encode file to base64 string."""
+        with open(file_path, 'rb') as f:
+            return base64.b64encode(f.read()).decode('utf-8')
+    
+    @staticmethod
+    def get_mime_type(file_path: str) -> str:
+        """Get MIME type from file extension."""
+        ext = FileUtils.get_file_extension(file_path)
+        mime_types = {
+            '.pdf': 'application/pdf',
+            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.zip': 'application/zip'
+        }
+        return mime_types.get(ext, 'application/octet-stream')
 
 
 class PDFImageExtractor:
@@ -286,6 +328,34 @@ async def handle_list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="extract_document_images_base64",
+            description="Extract images from a base64-encoded PDF or Word document. Accepts the document as base64 string and returns extracted images as base64-encoded data. Perfect for HTTP/remote scenarios where file system access is not shared.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "document_base64": {
+                        "type": "string",
+                        "description": "Base64-encoded document data (PDF or DOCX)"
+                    },
+                    "document_name": {
+                        "type": "string",
+                        "description": "Original filename with extension (e.g., 'document.pdf' or 'report.docx')"
+                    },
+                    "min_image_size": {
+                        "type": "integer",
+                        "description": "Minimum image dimension for PDF extraction (filters decorative images)",
+                        "default": 10
+                    },
+                    "return_images_as_base64": {
+                        "type": "boolean",
+                        "description": "If true, return extracted images as base64 strings; if false, return file paths",
+                        "default": True
+                    }
+                },
+                "required": ["document_base64", "document_name"],
+            },
+        ),
+        types.Tool(
             name="get_document_info",
             description="Get information about a document (page count, metadata, image count) without extracting images",
             inputSchema={
@@ -376,6 +446,100 @@ async def handle_call_tool(
             logger.error(f"Error extracting images: {str(e)}")
             return [types.TextContent(type="text", text=f"Error: {str(e)}")]
     
+    elif name == "extract_document_images_base64":
+        document_base64 = arguments.get("document_base64")
+        document_name = arguments.get("document_name")
+        min_image_size = arguments.get("min_image_size", 10)
+        return_images_as_base64 = arguments.get("return_images_as_base64", True)
+        
+        if not document_base64:
+            raise ValueError("document_base64 is required")
+        if not document_name:
+            raise ValueError("document_name is required")
+        
+        # Create temporary directory for processing
+        temp_dir = tempfile.mkdtemp(prefix="mcp_doc_extract_")
+        temp_doc_path = None
+        
+        try:
+            # Validate file extension
+            file_ext = FileUtils.get_file_extension(document_name)
+            if file_ext not in ['.pdf', '.docx']:
+                raise ValueError(f"Unsupported file type: {file_ext}. Supported types: .pdf, .docx")
+            
+            # Decode base64 to temporary file
+            temp_doc_path = os.path.join(temp_dir, document_name)
+            Base64Utils.decode_base64_to_file(document_base64, temp_doc_path)
+            logger.info(f"Decoded base64 document to: {temp_doc_path}")
+            
+            # Create extractor with settings
+            doc_extractor = DocumentExtractor(min_image_size=min_image_size, create_zip=True)
+            
+            # Create output directory within temp directory
+            output_dir = os.path.join(temp_dir, "extracted_images")
+            
+            # Extract images
+            extracted_images, actual_output_dir, zip_path = doc_extractor.extract_images(
+                temp_doc_path,
+                output_dir
+            )
+            
+            result = {
+                "status": "success",
+                "document_name": document_name,
+                "extracted_images": len(extracted_images),
+                "image_files": [os.path.basename(img) for img in extracted_images]
+            }
+            
+            # Return images as base64 if requested
+            if return_images_as_base64:
+                result["images_base64"] = []
+                for img_path in extracted_images:
+                    img_data = {
+                        "filename": os.path.basename(img_path),
+                        "mime_type": Base64Utils.get_mime_type(img_path),
+                        "base64": Base64Utils.encode_file_to_base64(img_path)
+                    }
+                    result["images_base64"].append(img_data)
+                
+                # Also encode the ZIP file if it exists
+                if zip_path and os.path.exists(zip_path):
+                    result["zip_base64"] = {
+                        "filename": os.path.basename(zip_path),
+                        "mime_type": "application/zip",
+                        "base64": Base64Utils.encode_file_to_base64(zip_path)
+                    }
+            else:
+                result["output_directory"] = actual_output_dir
+                result["full_paths"] = extracted_images
+                result["zip_file"] = zip_path
+            
+            response_text = f"Successfully extracted {len(extracted_images)} images from {document_name}\n"
+            if return_images_as_base64:
+                response_text += f"Images returned as base64-encoded data\n"
+                response_text += f"Files: {', '.join([os.path.basename(img) for img in extracted_images])}\n\n"
+            else:
+                response_text += f"Output directory: {actual_output_dir}\n"
+                response_text += f"Files: {', '.join([os.path.basename(img) for img in extracted_images])}\n\n"
+            
+            response_text += f"Full result: {json.dumps(result, indent=2)}"
+            
+            return [types.TextContent(type="text", text=response_text)]
+            
+        except Exception as e:
+            logger.error(f"Error extracting images from base64 document: {str(e)}")
+            return [types.TextContent(type="text", text=f"Error: {str(e)}")]
+        
+        finally:
+            # Cleanup temporary files
+            try:
+                import shutil
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                    logger.info(f"Cleaned up temporary directory: {temp_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to cleanup temporary directory: {str(e)}")
+    
     elif name == "get_document_info":
         document_path = arguments.get("document_path")
         
@@ -451,12 +615,20 @@ async def handle_call_tool(
         raise ValueError(f"Unknown tool: {name}")
 
 
-async def main():
-    """Main entry point for the server."""
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+# Create SSE transport handler
+sse = SseServerTransport("/messages")
+
+
+async def handle_sse(request):
+    """Handle SSE connections."""
+    async with sse.connect_sse(
+        request.scope,
+        request.receive,
+        request._send,
+    ) as streams:
         await server.run(
-            read_stream,
-            write_stream,
+            streams[0],
+            streams[1],
             InitializationOptions(
                 server_name="document-image-extractor-mcp",
                 server_version="0.1.0",
@@ -466,3 +638,179 @@ async def main():
                 ),
             ),
         )
+    return Response()
+
+
+async def handle_messages(request):
+    """Handle incoming messages."""
+    await sse.handle_post_message(request.scope, request.receive, request._send)
+    return Response()
+
+
+# REST API endpoints for Power Automate and simple HTTP clients
+
+async def handle_health(request):
+    """Health check endpoint."""
+    return JSONResponse({
+        "status": "healthy",
+        "service": "document-image-extractor-mcp",
+        "version": "0.1.0",
+        "endpoints": {
+            "mcp_sse": "/sse",
+            "mcp_messages": "/messages",
+            "rest_extract_base64": "/api/extract-base64",
+            "rest_health": "/api/health"
+        }
+    })
+
+
+async def handle_extract_base64_rest(request):
+    """
+    REST API endpoint for extracting images from base64 documents.
+    Simpler than MCP protocol - perfect for Power Automate, Zapier, etc.
+    
+    POST /api/extract-base64
+    Content-Type: application/json
+    
+    Body:
+    {
+        "document_base64": "<base64_string>",
+        "document_name": "report.pdf",
+        "min_image_size": 10,
+        "return_images_as_base64": true
+    }
+    """
+    try:
+        # Parse request body
+        body = await request.json()
+        
+        document_base64 = body.get("document_base64")
+        document_name = body.get("document_name")
+        min_image_size = body.get("min_image_size", 10)
+        return_images_as_base64 = body.get("return_images_as_base64", True)
+        
+        if not document_base64:
+            return JSONResponse(
+                {"error": "document_base64 is required"},
+                status_code=400
+            )
+        if not document_name:
+            return JSONResponse(
+                {"error": "document_name is required"},
+                status_code=400
+            )
+        
+        # Create temporary directory for processing
+        temp_dir = tempfile.mkdtemp(prefix="mcp_doc_extract_")
+        temp_doc_path = None
+        
+        try:
+            # Validate file extension
+            file_ext = FileUtils.get_file_extension(document_name)
+            if file_ext not in ['.pdf', '.docx']:
+                return JSONResponse(
+                    {"error": f"Unsupported file type: {file_ext}. Supported: .pdf, .docx"},
+                    status_code=400
+                )
+            
+            # Decode base64 to temporary file
+            temp_doc_path = os.path.join(temp_dir, document_name)
+            Base64Utils.decode_base64_to_file(document_base64, temp_doc_path)
+            logger.info(f"REST API: Decoded base64 document to: {temp_doc_path}")
+            
+            # Update extractor settings
+            global extractor
+            extractor = DocumentExtractor(min_image_size=min_image_size, create_zip=True)
+            
+            # Create output directory within temp directory
+            output_dir = os.path.join(temp_dir, "extracted_images")
+            
+            # Extract images
+            extracted_images, actual_output_dir, zip_path = extractor.extract_images(
+                temp_doc_path,
+                output_dir
+            )
+            
+            result = {
+                "status": "success",
+                "document_name": document_name,
+                "extracted_images_count": len(extracted_images),
+                "image_files": [os.path.basename(img) for img in extracted_images]
+            }
+            
+            # Return images as base64 if requested
+            if return_images_as_base64:
+                result["images"] = []
+                for img_path in extracted_images:
+                    img_data = {
+                        "filename": os.path.basename(img_path),
+                        "mime_type": Base64Utils.get_mime_type(img_path),
+                        "base64": Base64Utils.encode_file_to_base64(img_path)
+                    }
+                    result["images"].append(img_data)
+                
+                # Also encode the ZIP file if it exists
+                if zip_path and os.path.exists(zip_path):
+                    result["zip"] = {
+                        "filename": os.path.basename(zip_path),
+                        "mime_type": "application/zip",
+                        "base64": Base64Utils.encode_file_to_base64(zip_path)
+                    }
+            else:
+                result["output_directory"] = actual_output_dir
+                result["image_paths"] = extracted_images
+                result["zip_path"] = zip_path
+            
+            return JSONResponse(result)
+            
+        except Exception as e:
+            logger.error(f"REST API: Error extracting images: {str(e)}")
+            return JSONResponse(
+                {"error": str(e)},
+                status_code=500
+            )
+        
+        finally:
+            # Cleanup temporary files
+            try:
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                    logger.info(f"REST API: Cleaned up temporary directory: {temp_dir}")
+            except Exception as e:
+                logger.warning(f"REST API: Failed to cleanup: {str(e)}")
+    
+    except Exception as e:
+        logger.error(f"REST API: Request error: {str(e)}")
+        return JSONResponse(
+            {"error": "Invalid request format"},
+            status_code=400
+        )
+
+
+# Create Starlette app
+app = Starlette(
+    debug=True,
+    routes=[
+        # MCP protocol endpoints
+        Route("/sse", endpoint=handle_sse),
+        Route("/messages", endpoint=handle_messages, methods=["POST"]),
+        
+        # REST API endpoints (for Power Automate, etc.)
+        Route("/api/health", endpoint=handle_health, methods=["GET"]),
+        Route("/api/extract-base64", endpoint=handle_extract_base64_rest, methods=["POST"]),
+    ],
+)
+
+
+async def main():
+    """Main entry point for the HTTP server."""
+    import uvicorn
+    
+    config = uvicorn.Config(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info",
+    )
+    server_instance = uvicorn.Server(config)
+    await server_instance.serve()
